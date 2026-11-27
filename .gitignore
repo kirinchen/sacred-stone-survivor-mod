@@ -1,0 +1,21 @@
+# 遊戲複本(自備正版)與任何遊戲檔,一律不進 git
+game/
+extracted/
+*.assets
+*.bundle
+# build 產物
+mod/build/
+*.dll
+*.pdb
+*.obj
+# 截圖 / 錄影(原作畫面)
+shots/
+*.mp4
+*.mov
+*.webm
+*.png
+*.bmp
+# 系統
+.DS_Store
+Thumbs.db
+__pycache__/
