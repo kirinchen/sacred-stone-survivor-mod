@@ -12,7 +12,7 @@
 ## 怎麼裝(玩家)
 
 1. 在 Steam 買《聖石傳說 EX》並安裝好。
-2. 到本 repo 的 [Releases](../../releases/latest) 下載 **`dsound.dll`**(只要這一個檔)。
+2. 到本 repo 的 [Releases](../../releases/latest) 下載 **`dsound.dll`**(只要這一個檔)。瀏覽器可能警告「不常下載」(Edge:SmartScreen),點下載項目旁的「…」→「保留」→「仍要保留」。
 3. Steam 收藏庫 → 對《聖石傳說 EX》按右鍵 → **管理** → **瀏覽本機檔案**,會打開遊戲資料夾。
 4. 把 `dsound.dll` 放進這個資料夾(跟 `WUJIN.exe` 同一層)。
 5. 開遊戲。標題畫面**右上角**多一顆「**倖存者**」按鈕(或按 **F9**)→ 選地圖 → **Enter** 開一局。
