@@ -278,7 +278,13 @@ static void rg_play_tick(unsigned char **t, unsigned char *pl, DWORD now);
 static void rg_draw(HDC dc);
 static int  rg_money_now(void);
 static int  rg_input(UINT m, WPARAM w, LPARAM l);
-static int g_title_slot;      /* 從標題開局時讀哪一格存檔(rogue.c 的 title_save_slot 選) */
+static void rg_patch_call(unsigned site, unsigned expect, void *fn);
+static int g_title_slot;      /* 從標題開局時讀哪一格存檔(rogue.c 的 title_save_slot 選);-1 = 沒有存檔 → 開新遊戲 */
+static int g_ng_step, g_ng_busy, g_ng_timeout_ms = 300000, g_ng_started, g_ng_try; static DWORD g_ng_t, g_ng_t0, g_game_blt_t;
+static void ng_box_present(void);
+static void ng_paint_box(HDC dc);
+static void *g_big_surf[8]; static int g_big_n;      /* 建立時不是 640×480 的離屏 surface(開場 / 標題動畫用的 1920×1080):往主畫面 Blt 時當成動畫 */
+static int is_big_surf(void *s) { int i; for (i = 0; i < 8; i++) if (s && g_big_surf[i] == s) return 1; return 0; }      /* 沒存檔時的自動開新遊戲:第幾下點擊;g_ng_busy = 進行中(畫提示、擋玩家輸入) */
 static void rg_f9(void);
 static int  rg_ui_open(void);
 static int  ui_menu_open(void);
@@ -1297,6 +1303,7 @@ static LRESULT CALLBACK my_wndproc(HWND h, UINT m, WPARAM w, LPARAM l_orig) {
     static int logged;
     LPARAM l = (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST && m != WM_MOUSEWHEEL) ? mouse_lp640(h, l_orig) : l_orig;
     if (!g_hwnd) g_hwnd = h;
+    if (g_ng_busy && ((m >= WM_KEYFIRST && m <= WM_KEYLAST) || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST))) return 0;      /* 自動開新遊戲中:玩家的鍵盤滑鼠先不給原作(模組自己的點擊直接叫原作的 WndProc,不經過這裡) */
     if (m == WM_KEYDOWN && w == VK_F9) { if (!(l & 0x40000000)) rg_f9(); return 0; }   /* F9 不給遊戲:倖存者選單 / 放棄這一局 */
     if (m == WM_KEYUP && w == VK_F9) return 0;
     if (rg_input(m, w, l)) return 0;
@@ -1355,6 +1362,7 @@ static void hold_tick(void) {
 }
 static void key_tick(void) {
     click_tick(); hold_tick();
+    { static DWORD nb_; DWORD n_ = GetTickCount(); if (g_ng_busy && n_ - g_game_blt_t > 300 && n_ - nb_ > 250) { nb_ = n_; ng_box_present(); } }      /* 自動開新遊戲中、原作沒在出畫面(黑畫面 / 動畫)時,提示框自己畫上去 */
     int i; DWORD now = GetTickCount();
     for (i = 0; i < 16; i++) if (g_keys[i].vk && (int)(now - g_keys[i].up_at) >= 0) {
         CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYUP, g_keys[i].vk, 0xC0000001);
@@ -1482,7 +1490,7 @@ typedef HRESULT (__stdcall *gas_t)(void *self, void *caps, void **out);
 typedef HRESULT (__stdcall *lock_t2)(void *self, RECT *r, void *desc, DWORD fl, void *ev);
 typedef HRESULT (__stdcall *unlock_t2)(void *self, void *p);
 static struct { void **vt; blt_t blt; flip_t flip; bltfast_t bltfast; gas_t gas; lock_t2 lock; unlock_t2 unlock; } g_svt[8];
-static void *g_backbuf; static int g_gas_log, g_lock_log, g_blt_seen, g_in_ovl, g_fs_log;
+static void *g_backbuf; static int g_gas_log, g_lock_log, g_blt_seen, g_in_ovl, g_fs_log; static DWORD g_movie_blt_t;
 static void hook_surface(void *s);
 static int g_blt_log, g_bfast_log, g_flip_log;      /* 前幾次送上主畫面的參數寫進 log(全螢幕 / 別的解析度怎麼畫,查問題用) */
 static struct { void **vt; csurf_t cs; } g_dvt[8];
@@ -1602,11 +1610,44 @@ static void overlay_on_dc(void *surf, RECT *sr) {
         ((reldc_t)VT(surf)[26])(surf, dc);
     }
 }
+/* 自動開新遊戲時的提示框:畫進 640×480 的記憶體 DC,再貼到畫面上(視窗模式照 client 大小縮放;全螢幕直接畫主畫面) */
+static void ng_box_blit(HDC mdc) {      /* 記憶體 DC(640×480 座標)裡的提示框貼到畫面 */
+    HDC dc; RECT rc;
+    if (g_primary && !g_blt_seen) {      /* 全螢幕:主畫面就是 640×480(只在主執行緒做) */
+        if (((getdc_t)VT(g_primary)[17])(g_primary, &dc) == 0) { BitBlt(dc, 70, 150, 500, 150, mdc, 70, 150, SRCCOPY); ((reldc_t)VT(g_primary)[26])(g_primary, dc); }
+    } else if ((dc = GetDC(g_hwnd)) != NULL) {
+        GetClientRect(g_hwnd, &rc); SetStretchBltMode(dc, HALFTONE);
+        StretchBlt(dc, 70 * rc.right / 640, 150 * rc.bottom / 480, 500 * rc.right / 640, 150 * rc.bottom / 480, mdc, 70, 150, 500, 150, SRCCOPY);
+        ReleaseDC(g_hwnd, dc);
+    }
+}
+static void ng_box_present(void) {
+    static HDC mdc; static HBITMAP bm;
+    if (!g_ng_busy || !g_hwnd) return;
+    __try {
+        if (!mdc) { HDC w_ = GetDC(g_hwnd); mdc = CreateCompatibleDC(w_); bm = CreateCompatibleBitmap(w_, 640, 480); SelectObject(mdc, bm); ReleaseDC(g_hwnd, w_); }
+        ng_paint_box(mdc); ng_box_blit(mdc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+/* 視窗模式:確定之後到動畫之間,原作主迴圈會卡著好幾十秒(不出畫面、也不跑 tick)→ 另開執行緒每 0.5 秒畫一次(只畫視窗 DC,不碰 DirectDraw) */
+static DWORD WINAPI ng_box_thread(LPVOID p_) {
+    HDC mdc = NULL; HBITMAP bm = NULL;
+    while (g_ng_busy) {
+        if (g_hwnd && !(g_primary && !g_blt_seen)) __try {
+            if (!mdc) { HDC w_ = GetDC(g_hwnd); mdc = CreateCompatibleDC(w_); bm = CreateCompatibleBitmap(w_, 640, 480); SelectObject(mdc, bm); ReleaseDC(g_hwnd, w_); }
+            ng_paint_box(mdc); ng_box_blit(mdc);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        Sleep(500);
+    }
+    if (mdc) DeleteDC(mdc); if (bm) DeleteObject(bm);
+    return 0;
+}
 static HRESULT __stdcall my_blt(void *self, RECT *dr, void *src, RECT *sr, DWORD fl, void *fx) {
     int i = svt_find(VT(self));
     if (self == g_primary && src && g_blt_log < 4) { g_blt_log++; mlog("blt->primary dr=%ld,%ld,%ld,%ld sr=%ld,%ld,%ld,%ld fl=%08lx", dr ? dr->left : -1, dr ? dr->top : -1, dr ? dr->right : -1, dr ? dr->bottom : -1, sr ? sr->left : -1, sr ? sr->top : -1, sr ? sr->right : -1, sr ? sr->bottom : -1, fl); }
-    if (self == g_primary && src) {
-        g_blt_seen = 1; g_last_src = src; g_pb.has_dr = dr != NULL; g_pb.has_sr = sr != NULL; if (dr) g_pb.dr = *dr; if (sr) g_pb.sr = *sr; g_pb.fl = fl;
+    if (self == g_primary && src && (is_big_surf(src) || (sr && (sr->right - sr->left != 640 || sr->bottom - sr->top != 480)))) { HRESULT r_; frame_mark(); g_movie_blt_t = GetTickCount(); r_ = g_svt[i].blt(self, dr, src, sr, fl, fx); ng_box_present(); return r_; }      /* 動畫(來源 1920×1080 之類):不畫 overlay,也不當成遊戲畫面(全螢幕時會讓之後的 overlay 改走 Blt 路徑而畫不出來) */
+    else if (self == g_primary && src) {
+        g_blt_seen = 1; g_last_src = src; g_game_blt_t = GetTickCount(); g_pb.has_dr = dr != NULL; g_pb.has_sr = sr != NULL; if (dr) g_pb.dr = *dr; if (sr) g_pb.sr = *sr; g_pb.fl = fl;
         overlay_on(src, sr); frame_mark(); g_src_is_blt = 1;
     }
     return g_svt[i].blt(self, dr, src, sr, fl, fx);
@@ -1704,6 +1745,7 @@ static HRESULT __stdcall my_createsurface(void *self, void *desc, void **out, vo
         DWORD caps = *(DWORD *)((char *)desc + 104);       /* DDSURFACEDESC(2).ddsCaps.dwCaps */
         hook_surface(*out);
         if (caps & 0x200) { g_primary = *out; mlog("primary surface %p", g_primary); }
+        else if ((*(DWORD *)((char *)desc + 4) & 6) == 6 && (*(int *)((char *)desc + 12) > 640 || *(int *)((char *)desc + 8) > 480)) { g_big_surf[g_big_n++ & 7] = *out; }
     }
     return hr;
 }
@@ -1840,6 +1882,20 @@ static void do_maps(int lo, int hi) {
     mlog("maps: %d stages in %d..%d -> sss_maps.tsv", n, lo, hi);
 }
 static int g_rgb3;
+/* 新遊戲的開場動畫不走 0x422eb0(擋不到),改成看到動畫畫面就送 Esc 跳過 */
+static void goto_skip_movie(DWORD now) {
+    static DWORD last;
+    if (g_ng_started && g_ng_step > 3 && now - g_ng_t > 3000 && g_hwnd && now - g_movie_blt_t < 400 && now - last > 1500) {      /* 三下點完之後才跳(點選單時送 Esc 會把選單關掉) */ last = now; mlog("goto_map: skipping opening movie (Esc)"); CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYDOWN, VK_ESCAPE, 1); CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYUP, VK_ESCAPE, 0xC0000001); }
+}
+/* 沒有存檔時從標題開新遊戲:照玩家的操作點三下(遊戲開始 → 標準遊戲 → 難度 普通 → 確定),座標是原作 640×480 的,照視窗大小換算 */
+/* 標題的「確定」最後會叫 0x414e90(標題物件, 難度)開新遊戲(實測走 0x420f98;0x414c7c 也掛)→ 掛在那裡,知道三下點擊有沒有真的生效 */
+static void __fastcall ng_newgame(void *self, int edx, int diff) { g_ng_started = 1; mlog("new game started (difficulty %d)", diff); ((void (__fastcall *)(void *, int, int))0x414e90)(self, 0, diff); }
+static void ng_click(int x, int y) {
+    RECT rc; LPARAM lp;
+    if (!g_hwnd) return;
+    if (GetClientRect(g_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) { x = x * rc.right / 640; y = y * rc.bottom / 480; }
+    lp = MAKELPARAM(x, y); CallWindowProcA(g_orig_wndproc, g_hwnd, WM_MOUSEMOVE, 0, lp); g_click_lp = lp; g_click_step = 1;
+}
 static int g_goto_id = -1, g_goto_a, g_goto_b, g_goto_xy, g_goto_loaded, g_goto_watch, g_goto_from; static DWORD g_goto_at, g_goto_t0;
 static void autosave_patch(int off) {      /* 0x4197c5: mov byte [reg+0x1e4], 1 —— 立即數在 0x4197cb */
     unsigned char *p = (unsigned char *)0x4197c5; DWORD old;
@@ -1883,18 +1939,47 @@ static void map_tick(void) {
         }
         if (g_goto_id < 0 || !gs || !sc) return;
         if (!*(void **)(gs + 0x10)) {            /* 標題畫面:先讀自動存檔進遊戲,再換圖 */
-            if (!g_goto_loaded) { g_goto_loaded = 1; mlog("goto_map: at title -> load slot 0x%x first", g_title_slot); ((void (__fastcall *)(void *, int, int))0x4261b0)(GAME_APP, 0, g_title_slot); }
-            g_goto_at = now + 2500; return;
+            { static DWORD lg_; if (g_title_slot < 0 && now - lg_ > 3000) { lg_ = now; mlog("goto_map: waiting at title (new game) gs10=%p sc15c=%x", *(void **)(gs + 0x10), I32(sc, 0x15c)); } }
+            if (!g_goto_loaded) { g_goto_loaded = 1;
+                if (g_title_slot >= 0) { mlog("goto_map: at title -> load slot 0x%x first", g_title_slot); ((void (__fastcall *)(void *, int, int))0x4261b0)(GAME_APP, 0, g_title_slot); }
+                else { static int hooked_; if (!hooked_) { hooked_ = 1; rg_patch_call(0x420f98, 0x414e90, (void *)ng_newgame); rg_patch_call(0x414c7c, 0x414e90, (void *)ng_newgame); }
+                    mlog("goto_map: at title, no save -> new game first"); g_ng_step = 1; g_ng_t = g_ng_t0 = now; g_ng_busy = 1; g_ng_started = 0; g_ng_try = 0;
+                    { HANDLE th_ = CreateThread(NULL, 0, ng_box_thread, NULL, 0, NULL); if (th_) CloseHandle(th_); } }
+            }
+            if (g_title_slot < 0 && g_ng_step >= 1 && g_ng_step <= 3 && now - g_ng_t >= 1500) {
+                static const short xy[3][2] = { { 60, 393 }, { 320, 170 }, { 282, 332 } };      /* 遊戲開始 / 標準遊戲 / 確定(難度預設 普通) */
+                ng_click(xy[g_ng_step - 1][0], xy[g_ng_step - 1][1]); mlog("goto_map: new game click %d", g_ng_step); g_ng_step++; g_ng_t = now;
+            }
+            if (g_title_slot < 0 && g_ng_step == 4 && !g_ng_started && now - g_ng_t > 6000 && g_ng_try < 4 && g_hwnd) {      /* 點了沒生效(選單還沒出來、被動畫蓋掉…)→ Esc 兩下關掉子選單,從頭再點 */
+                g_ng_try++; mlog("goto_map: new game did not start, retry %d", g_ng_try);
+                CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYDOWN, VK_ESCAPE, 1); CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYUP, VK_ESCAPE, 0xC0000001);
+                g_ng_step = 0; g_ng_t = now;
+            }
+            if (g_title_slot < 0 && g_ng_step == 0 && g_ng_busy && now - g_ng_t > 1500) {
+                CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYDOWN, VK_ESCAPE, 1); CallWindowProcA(g_orig_wndproc, g_hwnd, WM_KEYUP, VK_ESCAPE, 0xC0000001);
+                g_ng_step = 1; g_ng_t = now;
+            }
+            g_goto_at = now + 2500; goto_skip_movie(now); return;
         }
+        if (g_title_slot < 0 && g_goto_loaded) goto_skip_movie(now);      /* 新遊戲:開場動畫跳過 */
         if ((int)(now - g_goto_at) < 0) return;
+        if (I32(sc, 0x15c) && g_title_slot < 0 && g_ng_step > 3) {      /* 新遊戲的開場劇情還在演(淡入淡出、對話)→ 點對話框、繼續等(整體 300 秒逾時) */
+            static DWORD k3_; if (now - k3_ > 500 && !g_click_step) { k3_ = now; ng_click(320, 420); }
+            return;
+        }
         if (I32(sc, 0x15c)) {            /* 原作正在淡出 / 換圖(主角死掉的結束畫面也算)→ 等 5 秒,還沒好就放棄 */
             if (now - g_goto_at > 5000) { mlog("goto_map: dropped - scene busy for 5s (flags=%x; fading / game over?)", I32(sc, 0x15c)); g_goto_id = -1; }
             return;
         }
         {   /* 主角死了(原作跳「進度讀取」選單)還換圖會當掉(實測 2 次)→ 不換 */
             unsigned char **t = obj_table(), *pl = t ? find_player(t) : NULL, *sb = pl ? *(unsigned char **)(pl + 0x1a4) : NULL;
+            if ((!sb || I32(sb, 0x50) <= 0) && g_title_slot < 0 && g_ng_step > 3) {      /* 新遊戲的開場劇情:主角還沒出來 → 點對話框跳過對話,繼續等(整體 120 秒逾時) */
+                static DWORD k_, lg2_; if (now - k_ > 500 && !g_click_step) { k_ = now; ng_click(320, 420); }      /* 對話框點一下 = 下一句 */
+                if (now - lg2_ > 3000) { lg2_ = now; mlog("goto_map: new game - waiting for the player (stage %d, pl=%p)", cur_stage_id(), pl); }
+                return; }
             if (!sb || I32(sb, 0x50) <= 0) { mlog("goto_map: refused - no live player (dead / game over?)"); g_goto_id = -1; return; }
         }
+        if (g_ng_busy) { g_ng_busy = 0; mlog("goto_map: new game ready after %us", (now - g_ng_t0) / 1000); }
         rg_before_goto();
         g_goto_from = cur_stage_id(); g_goto_t0 = now; g_goto_watch = 1; g_goto_loaded = 0;
         autosave_patch(1);
@@ -1956,6 +2041,7 @@ static void cmd_tick(void) {
         else if (sscanf(line, "rgpt %i", &a) == 1) { rg_pt_remove(); g_anim_miss = 0; rg_pt_join(a); }      /* 測試:直接讓角色 a 當夥伴 */
         else if (sscanf(line, "rgdrop %i", &a) == 1) { while (a-- > 0) rg_drop(0); }
         else if (sscanf(line, "rgitem %i %i", &a, &b) == 2) { while (b-- > 0) it_add(a); meta_save(); rg_dirty = 1; mlog("rgitem: item %d now x%d", a, it_find(a) >= 0 ? M.it[it_find(a)].n : 0); }      /* 測試:直接給 b 件物品 a */
+        else if (sscanf(line, "ngtimeout %i", &a) == 1) { g_ng_timeout_ms = a * 1000; mlog("new game timeout %ds", a); }      /* 測試:自動開新遊戲的逾時 */
         else if (sscanf(line, "rgsynth %i", &a) == 1) { g_synth_pct = a; mlog("synth success %d%%", a); }
         else if (!strncmp(line, "meta", 4)) { if (sscanf(line + 4, " money %i", &a) == 1) M.money = a; else if (sscanf(line + 4, " cleared %i", &a) == 1) M.cleared = a; else if (sscanf(line + 4, " slots %i", &a) == 1) M.slots = a; else if (sscanf(line + 4, " lead %i", &a) == 1) { int j_; for (j_ = 0; j_ < M.nchars && M.chars[j_] != a; j_++); if (j_ == M.nchars && M.nchars < 16) M.chars[M.nchars++] = a; M.lead = a; } else { rg_cmd_meta(); continue; } meta_save(); rg_dirty = 1; rg_cmd_meta(); }
         else if (sscanf(line, "survtscale %i", &a) == 1) { DWORD ms_ = g_surv ? surv_ms() : 0; g_tscale = a < 1 ? 1 : a; if (g_surv) g_toff += ms_ - surv_ms(); mlog("time scale x%d", g_tscale); }

@@ -207,7 +207,7 @@ static void rg_patch_call(unsigned site, unsigned expect, void *fn) {
  * 倖存者選單開著時不播;其他時候照原作。 */
 static int g_movie_skip;
 static void __fastcall rg_movie(void *app, int edx_, const char *name) {
-    if (rg_ui) { if (g_movie_skip++ < 20) mlog("movie skipped while survivor menu open: %s", name ? name : "?"); return; }
+    if (rg_ui || rg_state == RG_LOAD) { if (g_movie_skip++ < 20) mlog("movie skipped (survivor menu open / run loading): %s", name ? name : "?"); return; }
     ((void (__fastcall *)(void *, int, const char *))0x422eb0)(app, 0, name);
 }
 static void rg_movie_hook(void) { static int done; if (!done) { done = 1; rg_patch_call(0x43ec1c, 0x422eb0, (void *)rg_movie); } }      /* 選單一打開就要裝(標題畫面還沒開過局) */
@@ -521,7 +521,8 @@ static void rg_start(int map) {
     if (map < 0 || map >= RG_NMAP || (rg_state != RG_OFF && rg_state != RG_RESULT)) return;
     if (GAME_GS && !*(void **)(GAME_GS + 0x10)) {      /* 在標題畫面 */
         int s_ = title_save_slot();
-        if (s_ < 0) { wcscpy(rg_hub_msg, L"找不到原作存檔:請先在標題選「遊戲開始」,玩到能走動(會自動存檔),再按 F9 回來開局"); rg_dirty = 1; mlog("ROGUE start refused: no save file to enter the game from the title"); return; }
+        g_ng_step = 0; g_ng_busy = 0;
+        if (s_ < 0) mlog("ROGUE start: no save file -> start a new game from the title first (遊戲開始 → 標準遊戲 → 普通 → 確定)");
         g_title_slot = s_;
     }
     if (M.lead < 1 || M.lead > 7) M.lead = 1;
@@ -869,6 +870,16 @@ static void rg_draw_result(HDC dc) {
     if (!rg_res.win) rg_text(dc, 92, y, RGB(200, 200, 200), L"錢和撿到的裝備都留著;等級、屬性、這局學的招不留。");
     rg_button(dc, 220, 352, 200, 36, L"Enter 回倖存者選單", A_OK, 0, VK_RETURN, 1);
 }
+static void ng_paint_box(HDC dc) {
+    wchar_t buf[64]; HGDIOBJ of;
+    rg_fonts(); of = SelectObject(dc, g_font_s); SetBkMode(dc, TRANSPARENT);
+    rg_box(dc, 70, 150, 570, 300, RGB(14, 14, 30), RGB(200, 170, 80));
+    rg_text(dc, 92, 166, RGB(255, 210, 90), L"第一次開局:正在幫你跳過原作開場");
+    rg_text(dc, 92, 198, RGB(255, 255, 255), L"大約 2–3 分鐘,請不要動滑鼠和鍵盤");
+    rg_text(dc, 92, 224, RGB(200, 200, 200), L"(畫面會自己切換、對話會自己跳過,是正常的)");
+    _snwprintf(buf, 64, L"已經過 %u 秒", (GetTickCount() - g_ng_t0) / 1000); buf[63] = 0; rg_text(dc, 92, 258, RGB(160, 220, 255), buf);
+    SelectObject(dc, of);
+}
 static void rg_draw(HDC dc) {
     HGDIOBJ of; wchar_t buf[200], nm[48]; int n;
     rg_fonts(); rg_nhit = 0;
@@ -876,8 +887,11 @@ static void rg_draw(HDC dc) {
     if (rg_ui == UI_HUB) rg_draw_hub(dc);
     else if (rg_ui == UI_RESULT) rg_draw_result(dc);
     else if (rg_state == RG_LOAD || rg_state == RG_GOTO || rg_state == RG_SETUP) {
+        if (g_ng_busy) ng_paint_box(dc);      /* 沒存檔、自動開新遊戲中(約 2–3 分鐘) */
+        else {
         rg_box(dc, 180, 200, 460, 250, RGB(14, 14, 30), RGB(200, 170, 80));
         _snwprintf(buf, 200, L"進入 %s …", RG_MAPS[rg_map].name); rg_text(dc, 200, 216, RGB(255, 255, 255), buf);
+        }
     } else if (rg_state == RG_HOME) {
         rg_box(dc, 180, 200, 460, 250, RGB(14, 14, 30), RGB(200, 170, 80)); rg_text(dc, 200, 216, RGB(255, 255, 255), L"回到原本的地圖 …");
     } else if (g_rg) {
@@ -1010,7 +1024,8 @@ static void rg_tick(void) {
                 unsigned char *gs = GAME_GS, *pl = gs ? *(unsigned char **)(gs + 8) : NULL, *sb = pl ? *(unsigned char **)(pl + 0x1a4) : NULL; int sid = cur_stage_id();
                 if (rg_in_stage() && sb && I32(sb, 0x50) > 0 && (sid == RG_MAPS[rg_map].stage || sid % 200 == RG_MAPS[rg_map].stage % 200 || sid != g_goto_from)) { rg_state = RG_SETUP; rg_t = now + 700; }
                 else { mlog("ROGUE: could not enter map %d (stage now %d)", rg_map, sid); rg_state = RG_OFF; toast(L"進場失敗"); }
-            } else if ((int)(now - rg_t) > 20000) { mlog("ROGUE: enter timeout (now %u rg_t %u goto_id %d watch %d)", now, rg_t, g_goto_id, g_goto_watch); rg_state = RG_OFF; g_goto_id = -1; }
+            } else if ((int)(now - rg_t) > (g_title_slot < 0 ? g_ng_timeout_ms : 20000)) { mlog("ROGUE: enter timeout (now %u rg_t %u goto_id %d watch %d)", now, rg_t, g_goto_id, g_goto_watch); rg_state = RG_OFF; g_goto_id = -1;
+                if (g_ng_busy) { g_ng_busy = 0; g_ng_step = 0; wcscpy(rg_hub_msg, L"自動開局失敗:請先在標題選「遊戲開始」玩到能走動(會自動存檔),再按 F9 回來開局"); rg_hub_open(); } }
             break;
         case RG_SETUP:
             if ((int)(now - rg_t) < 0) break;
